@@ -405,6 +405,17 @@ fn io_error_to_status(e: io::Error) -> Response<BoxBody<Bytes, std::io::Error>>{
     return res;
 }
 
+fn make_error_res(status_code:StatusCode)-> Response<BoxBody<Bytes, std::io::Error>>{
+    let res_builder = Response::builder()
+        .status(status_code);
+    let res_builder = match status_code{
+        StatusCode::INTERNAL_SERVER_ERROR => res_builder.body(Full::new(INTERNAL_SERVER_ERROR.into()).map_err(|e| match e {}).boxed()),
+        StatusCode::NOT_FOUND => res_builder.body(Full::new(NOTFOUND.into()).map_err(|e| match e {}).boxed()),
+        _ => res_builder.body(Full::new(INTERNAL_SERVER_ERROR.into()).map_err(|e| match e {}).boxed()),
+    };
+    return res_builder.unwrap();
+}
+
 impl Server {
     fn handle_propfind_path_recursive<W: Write>(&self,
                                                 path: &Path,
@@ -575,28 +586,30 @@ impl Server {
         let path = self.uri_to_path(&req);
         debug!("Get path {:?}", path);
         
-        let f = File::open(&path);
-        let mut file = match f {
-            Ok(file) => file,
-            Err(e) => {
-                return io_error_to_status(e);
-            },
-        };
+        let file = tokio::fs::File::open(path.clone()).await;
+        if file.is_err() {
+            eprintln!("ERROR: Unable to open file.");
+            return make_error_res(StatusCode::NOT_FOUND);
+            
+        }
+        let file = file.unwrap();
         
-        let size = file.metadata()
+        let size = file.metadata().await
             .map(|m| m.len())
             .map_err(|e| io_error_to_status(e)).unwrap();
 
-        // let mut contents = String::new();
-        let mut contents = Vec::new();
+        let reader_stream = ReaderStream::new(file);
+
+        // Convert to http_body_util::BoxBody
+        let stream_body = StreamBody::new(reader_stream.map_ok(Frame::data));
+        let boxed_body = stream_body.boxed();
+    
         // TODO: byte ranges (Accept-Ranges: bytes)
-
-        let read_size = file.read_to_end(&mut contents).unwrap();
-
+        // Send response
         let mut res = Response::builder()
-                .status(StatusCode::OK)
-                .body(Full::new(contents.into()).map_err(|e| match e {}).boxed())
-                .unwrap();
+            .status(StatusCode::OK)
+            .body(boxed_body)
+            .unwrap();       
             
         let hadermap = res.headers_mut();
 
