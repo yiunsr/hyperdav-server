@@ -22,7 +22,7 @@ use hyper::service::service_fn;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use std::env;
-    env::set_var("RUST_BACKTRACE", "1");
+    env::set_var("RUST_BACKTRACE", "full");
     env_logger::Builder::new().filter_level(log::LevelFilter::max()).init();
 
     let addr: SocketAddr = ([127, 0, 0, 1], 9091).into();

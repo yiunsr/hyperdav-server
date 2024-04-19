@@ -21,7 +21,8 @@ use std::fs::{Metadata, read_dir, File};
 use std::path::{Path, PathBuf};
 use log::{error, debug};
 
-use http_body_util::{BodyExt, Full, StreamBody};
+use percent_encoding::percent_decode;
+use http_body_util::{combinators::BoxBody, BodyExt, Full, StreamBody};
 use hyper::body::Frame;
 use hyper::{Request, Response};
 use hyper::StatusCode;
@@ -367,6 +368,7 @@ fn handle_propfind_path<W: Write>(xmlwriter: &mut EventWriter<W>, path: &PathBuf
     xmlwriter.write(XmlWEvent::characters("HTTP/1.1 200 OK"))?;
     xmlwriter.write(XmlWEvent::end_element())?; // status
     xmlwriter.write(XmlWEvent::end_element())?; // propstat
+    xmlwriter.write(XmlWEvent::end_element())?; // response
 
     return Ok(());
 
@@ -387,17 +389,20 @@ fn handle_propfind_path<W: Write>(xmlwriter: &mut EventWriter<W>, path: &PathBuf
     Ok(())
 }
 
-fn io_error_to_status(e: io::Error) -> Result<Response<Full<Bytes>>, Infallible> {
+fn io_error_to_status(e: io::Error) -> Response<BoxBody<Bytes, std::io::Error>>{
     if e.kind() == ErrorKind::NotFound {
-        let res = Response::builder().status(StatusCode::NOT_FOUND).body(
-            Full::new(Bytes::from(NOTFOUND))
-        );
-        return Ok(res.unwrap());
+        let res = Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(Full::new(NOTFOUND.into()).map_err(|e| match e {}).boxed())
+                .unwrap();
+        return res;
     }
-    let res = Response::builder().status(StatusCode::INTERNAL_SERVER_ERROR).body(
-        Full::new(Bytes::from(INTERNAL_SERVER_ERROR))
-    );
-    return Ok(res.unwrap());
+
+    let res = Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Full::new(INTERNAL_SERVER_ERROR.into()).map_err(|e| match e {}).boxed())
+                .unwrap();
+    return res;
 }
 
 impl Server {
@@ -439,9 +444,11 @@ impl Server {
                    -> PathBuf {
         let mut extend_path = req.uri().path();
         extend_path = &extend_path[1..];
+        let extend_path = percent_decode(extend_path.as_bytes())
+            .decode_utf8_lossy();
         let root_path = self.serverpath.srv_root.to_str().unwrap().to_string();
         let mut full_path = PathBuf::from(root_path);
-        full_path.push(extend_path);
+        full_path.push(extend_path.as_ref());
         return full_path;
     }
 
@@ -487,7 +494,7 @@ impl Server {
     */
 
     async fn handle_propfind(&self, req: Request<hyper::body::Incoming>)
-                       -> Result<Response<Full<Bytes>>, Infallible> {
+                        -> Response<BoxBody<Bytes, std::io::Error>>{
         
         // Get the file
         let path = self.uri_to_path(&req);
@@ -511,16 +518,15 @@ impl Server {
             parse_config);
         let mut props = Vec::new();
         if let Err(e) = parse_propfind(xml, |prop| { props.push(prop); }) {
-            let mut res = Response::new(Full::new(Bytes::from(BAD_REQUEST)));
-            *res.status_mut() = StatusCode::NOT_FOUND;
-            return Ok(res);
+            let res = Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(Full::new(BAD_REQUEST.into()).map_err(|e| match e {}).boxed())
+                .unwrap();
+            return res;
         }
 
         debug!("Propfind {:?} {:?}", path, props);
-
-        let res_build = Response::builder().status(StatusCode::MULTI_STATUS);
         let meta = path.metadata().unwrap();
-
         let mut xmlwriter = EventWriter::new_with_config(Vec::new(),
                                                          EmitterConfig {
                                                              perform_indent: true,
@@ -543,8 +549,8 @@ impl Server {
         if meta.is_dir() {
             self.handle_propfind_path_recursive(&path, depth, &mut xmlwriter, &props).unwrap();
         }
-
         xmlwriter.write(XmlWEvent::end_element()).unwrap();
+        
         let xlm_body = xmlwriter.into_inner();
 
         let xlm_body2 = xlm_body.clone();
@@ -553,14 +559,18 @@ impl Server {
         debug!("{}", xlm_body_str);
         debug!("==== Propfind Resonse End ====\n");
         
-        let res_result = res_build.body(
-            Full::new(Bytes::from(xlm_body))
-        ).unwrap();
-        Ok(res_result)
+
+        let res = Response::builder()
+                .status(StatusCode::OK)
+                .body(Full::new(Bytes::from(xlm_body)).map_err(|e| match e {}).boxed())
+                .unwrap();
+        return res;
     }
 
     
-    async fn handle_get(&self, req: Request<hyper::body::Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {
+    async fn handle_get(&self, req: Request<hyper::body::Incoming>) 
+            // -> Result<Response<Full<Bytes>>, Infallible> {
+            -> Response<BoxBody<Bytes, std::io::Error>>{
         // Get the file
         let path = self.uri_to_path(&req);
         debug!("Get path {:?}", path);
@@ -583,9 +593,11 @@ impl Server {
 
         let read_size = file.read_to_end(&mut contents).unwrap();
 
-        let mut res = Response::builder().status(StatusCode::INTERNAL_SERVER_ERROR)
-            .body(Full::new(Bytes::from(contents)))
-            .unwrap();
+        let mut res = Response::builder()
+                .status(StatusCode::OK)
+                .body(Full::new(contents.into()).map_err(|e| match e {}).boxed())
+                .unwrap();
+            
         let hadermap = res.headers_mut();
 
         // Ignore size = 0 to hopefully work reasonably with special files
@@ -603,7 +615,7 @@ impl Server {
             &context_type
         ).unwrap());
 
-        return Ok(res);
+        return res;
 
     }
 
@@ -683,8 +695,8 @@ fn empty() -> Full<Bytes>{
     return emp;
 }
 
-pub async fn handle(server:&Server, req: Request<hyper::body::Incoming>) -> Result<Response<Full<Bytes>>, Infallible>{
-// Result<Response<BoxBody>>  {
+pub async fn handle(server:&Server, req: Request<hyper::body::Incoming>) 
+    -> hyper::Result<Response<BoxBody<Bytes, std::io::Error>>> {
     debug!("Request {:?}", req.method());
     
 
@@ -699,7 +711,10 @@ pub async fn handle(server:&Server, req: Request<hyper::body::Incoming>) -> Resu
         "MKCOL" => RequestType::Mkdir,
         _ => {
 
-            let mut res = Response::new(Full::new(Bytes::from(BAD_REQUEST)));
+            let mut res = Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(Full::new(NOTFOUND.into()).map_err(|e| match e {}).boxed())
+                .unwrap();
             *res.status_mut() = StatusCode::NOT_FOUND;
             return Ok(res);
         }
@@ -719,9 +734,12 @@ pub async fn handle(server:&Server, req: Request<hyper::body::Incoming>) -> Resu
             );
             hadermap.insert("DAV", hyper::header::HeaderValue::from_str("1").unwrap());
 
-            let r = Response::new(Full::new(Bytes::from("")));
-            let r2:  Result<Response<Full<Bytes>>, Infallible> = Ok(r);
-            r2
+            let mut res = Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(Full::new(BAD_REQUEST.into()).map_err(|e| match e {}).boxed())
+                .unwrap();
+            return Ok(res);
+            
         }
         RequestType::Propfind =>{
             server.handle_propfind(req).await
@@ -736,14 +754,17 @@ pub async fn handle(server:&Server, req: Request<hyper::body::Incoming>) -> Resu
         // RequestType::Mkdir => server.handle_mkdir(req, res),
         _=>{
             error!("Request error");
-            let mut res = Response::new(Full::new(Bytes::from(BAD_REQUEST)));
-            *res.status_mut() = StatusCode::NOT_FOUND;
+
+            let mut res = Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(Full::new(BAD_REQUEST.into()).map_err(|e| match e {}).boxed())
+                .unwrap();
             return Ok(res);
         }
     };
     
     //result_res
-    return result_res;
+    return Ok(result_res);
 
     // let response = Response::new(Full::new(Bytes::from("Hello World!")));
     // Ok(response)

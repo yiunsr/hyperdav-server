@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<D:multistatus xmlns:D="DAV:">
+  <D:response>
+    <D:href>http://127.0.0.1:9091/</D:href>
+    <D:propstat>
+      <D:prop>
+        <D:creationdate>2024-04-19T03:20:56.114105800+00:00</D:creationdate>
+        <D:displayname>tt</D:displayname>
+        <D:getcontentlength>0</D:getcontentlength>
+        <D:getcontenttype>httpd/unix-directory</D:getcontenttype>
+        <D:getetag>6166a93b6735e</D:getetag>
+        <D:getlastmodified>2024-04-19T03:21:00.816222200+00:00</D:getlastmodified>
+        <D:resourcetype>
+          <D:collection />
+        </D:resourcetype>
+      </D:prop>
+      <D:status>HTTP/1.1 200 OK</D:status>
+    </D:propstat>
+    <D:response>
+      <D:href>http://127.0.0.1:9091/tt.txt</D:href>
+      <D:propstat>
+        <D:prop>
+          <D:creationdate>2024-04-19T03:21:00.816222200+00:00</D:creationdate>
+          <D:displayname>tt.txt</D:displayname>
+          <D:getcontentlength>101</D:getcontentlength>
+          <D:getcontenttype>text/plain</D:getcontenttype>
+          <D:getetag>61577d0ca29ae</D:getetag>
+          <D:getlastmodified>2024-04-07T01:43:28.465326700+00:00</D:getlastmodified>
+          <D:resourcetype />
+        </D:prop>
+        <D:status>HTTP/1.1 200 OK</D:status>
+      </D:propstat>
+  </D:response>
