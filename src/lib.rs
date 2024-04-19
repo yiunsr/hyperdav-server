@@ -9,37 +9,47 @@
 //!    .handle(hyperdav_server::Server::new("", std::path::Path::new("/")))
 //!    .unwrap();
 //!```
-extern crate chrono;
-extern crate hyper;
-#[macro_use]
-extern crate log;
-extern crate url;
-extern crate xml;
+//! 
+
+use std::convert::Infallible;
+use bytes::{Bytes, Buf};
 
 use std::borrow::{Borrow, Cow};
 use std::time::{UNIX_EPOCH, SystemTime};
 use std::io::{self, Read, Write, ErrorKind};
-use std::fs::{self, Metadata, read_dir, File};
+use std::fs::{Metadata, read_dir, File};
 use std::path::{Path, PathBuf};
+use log::{error, debug};
 
-use hyper::header::ContentLength;
-use hyper::method::Method;
-use hyper::server::{Handler, Request, Response};
-use hyper::status::StatusCode;
-use hyper::uri::RequestUri;
-use xml::{EmitterConfig, ParserConfig};
+use http_body_util::{BodyExt, Full, StreamBody};
+use hyper::body::Frame;
+use hyper::{Request, Response};
+use hyper::StatusCode;
+use tokio_util::io::ReaderStream;
+use futures_util::TryStreamExt;
+use mime_guess;
+
+use xml::reader::ParserConfig;
+use xml::writer::EmitterConfig;
 use xml::common::XmlVersion;
 use xml::name::{Name, OwnedName};
 use xml::reader::XmlEvent;
 use xml::writer::EventWriter;
 use xml::writer::XmlEvent as XmlWEvent;
 
+
+static INTERNAL_SERVER_ERROR: &[u8] = b"Internal Server Error";
+static NOTFOUND: &[u8] = b"Not Found";
+static BAD_REQUEST: &[u8] = b"bad Request";
+
+#[derive(Debug, Clone)]
 struct ServerPath {
     // HTTP path on the server representing the root directory
-    url_prefix: Cow<'static, str>,
+    pub url_prefix: Cow<'static, str>,
     // Root file system directory of the server
-    srv_root: Cow<'static, Path>,
+    pub srv_root: Cow<'static, Path>,
 }
+
 
 impl ServerPath {
     // Ex. url_prefix = "/dav", srv_root = "/srv/dav/"
@@ -48,13 +58,10 @@ impl ServerPath {
         let url_prefix = url_prefix.into();
         let srv_root = srv_root.into();
 
-        assert_eq!(url_prefix.trim_right_matches("/"), url_prefix);
-        assert!(srv_root.ends_with("/"));
+        // assert_eq!(url_prefix.trim_right_matches("/"), url_prefix);
+        // assert!(srv_root.ends_with("/"));
 
-        ServerPath {
-            url_prefix: url_prefix,
-            srv_root: srv_root,
-        }
+        ServerPath {url_prefix, srv_root}
     }
 
     fn file_to_url<P: AsRef<Path>>(&self, path: P) -> String {
@@ -67,8 +74,8 @@ impl ServerPath {
     fn url_to_file<'a>(&'a self, url: &'a str) -> Option<PathBuf> {
         if url.starts_with(self.url_prefix.borrow() as &str) {
             let subpath = &url[self.url_prefix.len()..]
-                               .trim_left_matches("/")
-                               .trim_right_matches("/");
+                               .trim_start_matches("/")
+                               .trim_end_matches("/");
             let mut ret = self.srv_root.clone().into_owned();
             ret.push(subpath);
             Some(ret)
@@ -92,6 +99,7 @@ fn test_serverpath() {
     assert_eq!(&s.file_to_url("/"), "/dav/");
 }
 
+#[derive(Debug, Clone)]
 pub struct Server {
     serverpath: ServerPath,
 }
@@ -231,21 +239,16 @@ fn write_client_prop<W: Write>(xmlwriter: &mut EventWriter<W>,
 }
 
 fn systime_to_format(time: SystemTime) -> String {
-    use chrono::datetime::DateTime;
-    use chrono::naive::datetime::NaiveDateTime;
-    use chrono::offset::utc::UTC;
+    use chrono::DateTime;
+    use chrono::Utc;
 
     let unix = time.duration_since(UNIX_EPOCH).unwrap();
-    let time = DateTime::<UTC>::from_utc(NaiveDateTime::from_timestamp(unix.as_secs() as i64,
-                                                                       unix.subsec_nanos()),
-                                         UTC);
+    let time: DateTime<Utc> = DateTime::from_timestamp(unix.as_secs() as i64, unix.subsec_nanos()).unwrap();
     time.to_rfc3339()
 }
 
-fn handle_prop_path<W: Write>(xmlwriter: &mut EventWriter<W>,
-                              meta: &Metadata,
-                              prop: Name)
-                              -> Result<bool, Error> {
+fn handle_prop_path<W: Write>(xmlwriter: &mut EventWriter<W>, path: &PathBuf, url: &str,
+            meta: &Metadata, prop: Name) -> Result<bool, Error> {
     match (prop.namespace, prop.local_name) {
         (Some("DAV:"), "resourcetype") => {
             xmlwriter.write(XmlWEvent::start_element("D:resourcetype"))?;
@@ -299,17 +302,45 @@ fn handle_prop_path<W: Write>(xmlwriter: &mut EventWriter<W>,
             xmlwriter.write(XmlWEvent::end_element())?;
             Ok(true)
         }
+        (Some("DAV:"), "displayname") => {
+            let file_name = path.file_name().unwrap().to_string_lossy().to_string();
+            xmlwriter
+                .write(XmlWEvent::start_element("D:displayname"))?;
+            xmlwriter
+                .write(XmlWEvent::characters(&file_name))?;
+            xmlwriter.write(XmlWEvent::end_element())?;
+            Ok(true)
+        }
+        (Some("DAV:"), "getetag") => {
+            let etag = get_etag(&meta);
+            xmlwriter
+                .write(XmlWEvent::start_element("D:getetag"))?;
+            xmlwriter
+                .write(XmlWEvent::characters(&etag))?;
+            xmlwriter.write(XmlWEvent::end_element())?;
+            Ok(true)
+        }
+        
         _ => Ok(false),
     }
 }
 
-fn handle_propfind_path<W: Write>(xmlwriter: &mut EventWriter<W>,
-                                  url: &str,
-                                  meta: &Metadata,
-                                  props: &[OwnedName])
-                                  -> Result<(), Error> {
+fn get_etag(meta: &Metadata)->String{
+    let modified = meta.modified().unwrap();
+    let t = modified.duration_since(UNIX_EPOCH).ok().unwrap();
+    let t = t.as_secs() * 1000000 + t.subsec_nanos() as u64 / 1000;
+    if meta.is_file() {
+        format!("{:x}", t)
+    } else {
+        format!("{:x}", t)
+    }
+}
+
+fn handle_propfind_path<W: Write>(xmlwriter: &mut EventWriter<W>, path: &PathBuf, url: &str,
+            meta: &Metadata, props: &[OwnedName])-> Result<(), Error> {
     xmlwriter.write(XmlWEvent::start_element("D:response"))?;
 
+    debug!("href : {}", url);
     xmlwriter.write(XmlWEvent::start_element("D:href"))?;
     xmlwriter.write(XmlWEvent::characters(url))?;
     xmlwriter.write(XmlWEvent::end_element())?; // href
@@ -318,7 +349,7 @@ fn handle_propfind_path<W: Write>(xmlwriter: &mut EventWriter<W>,
     xmlwriter.write(XmlWEvent::start_element("D:propstat"))?;
     xmlwriter.write(XmlWEvent::start_element("D:prop"))?;
     for prop in props {
-        if !handle_prop_path(xmlwriter, meta, prop.borrow())? {
+        if !handle_prop_path(xmlwriter, path, url, meta, prop.borrow())? {
             failed_props.push(prop);
         }
     }
@@ -337,6 +368,8 @@ fn handle_propfind_path<W: Write>(xmlwriter: &mut EventWriter<W>,
     xmlwriter.write(XmlWEvent::end_element())?; // status
     xmlwriter.write(XmlWEvent::end_element())?; // propstat
 
+    return Ok(());
+
     // Handle the failed properties
     xmlwriter.write(XmlWEvent::start_element("D:propstat"))?;
     xmlwriter.write(XmlWEvent::start_element("D:prop"))?;
@@ -354,13 +387,17 @@ fn handle_propfind_path<W: Write>(xmlwriter: &mut EventWriter<W>,
     Ok(())
 }
 
-fn io_error_to_status(e: io::Error, res: &mut Response<hyper::net::Fresh>) -> io::Error {
+fn io_error_to_status(e: io::Error) -> Result<Response<Full<Bytes>>, Infallible> {
     if e.kind() == ErrorKind::NotFound {
-        *res.status_mut() = StatusCode::NotFound;
-    } else {
-        *res.status_mut() = StatusCode::InternalServerError;
+        let res = Response::builder().status(StatusCode::NOT_FOUND).body(
+            Full::new(Bytes::from(NOTFOUND))
+        );
+        return Ok(res.unwrap());
     }
-    e
+    let res = Response::builder().status(StatusCode::INTERNAL_SERVER_ERROR).body(
+        Full::new(Bytes::from(INTERNAL_SERVER_ERROR))
+    );
+    return Ok(res.unwrap());
 }
 
 impl Server {
@@ -389,7 +426,7 @@ impl Server {
                     continue;
                 }
             };
-            handle_propfind_path(xmlwriter, &self.serverpath.file_to_url(&path), &meta, props)?;
+            handle_propfind_path(xmlwriter, &path, &self.serverpath.file_to_url(&path), &meta, props)?;
             // Ignore errors in order to try the other files. This could fail for
             // connection reasons (not file I/O), but those should retrigger and
             // get passed up on subsequent xml writes
@@ -398,41 +435,33 @@ impl Server {
         Ok(())
     }
 
-    fn uri_to_path(&self,
-                   req: &Request,
-                   res: &mut Response<hyper::net::Fresh>)
-                   -> Result<PathBuf, Error> {
-        if let RequestUri::AbsolutePath(ref s) = req.uri {
-                // Unwrap should hopefully be safe since we just came from a string
-                let s = url::percent_encoding::percent_decode(s.as_bytes())
-                    .decode_utf8()
-                    .expect("percent decode");
-                self.serverpath.url_to_file(s.borrow())
-            } else {
-                None
-            }
-            .ok_or_else(|| {
-                            *res.status_mut() = StatusCode::NotFound;
-                            Error::BadPath
-                        })
+    fn uri_to_path(&self, req: &Request<hyper::body::Incoming>)
+                   -> PathBuf {
+        let mut extend_path = req.uri().path();
+        extend_path = &extend_path[1..];
+        let root_path = self.serverpath.srv_root.to_str().unwrap().to_string();
+        let mut full_path = PathBuf::from(root_path);
+        full_path.push(extend_path);
+        return full_path;
     }
 
+    /*
     fn uri_to_src_dst(&self,
-                      req: &Request,
-                      res: &mut Response<hyper::net::Fresh>)
+                      req: &Request<hyper::body::Incoming>,
+                      res: &mut Response<BoxBody<Bytes, hyper::Error>>)
                       -> Result<(PathBuf, PathBuf), Error> {
         // Get the source
-        let src = self.uri_to_path(req, res)?;
+        let src = self.uri_to_path(req);
 
         // Get the destination
-        let dst = req.headers
-            .get_raw("Destination")
-            .and_then(|vec| vec.get(0))
+        let dst = req.headers()
+            .get("Destination")
+            .and_then(|vec| Some(vec.as_bytes()))
             .and_then(|vec| std::str::from_utf8(vec).ok())
             .and_then(|s| url::Url::parse(s).ok())
             .ok_or(Error::BadPath)
             .map_err(|e| {
-                         *res.status_mut() = StatusCode::BadRequest;
+                         *res.status_mut() = StatusCode::BAD_REQUEST;
                          e
                      })?;
         let dst = url::percent_encoding::percent_decode(dst.path().as_bytes())
@@ -444,51 +473,55 @@ impl Server {
                               .ok_or(Error::BadPath)
                       })
             .map_err(|e| {
-                         *res.status_mut() = StatusCode::BadRequest;
+                         *res.status_mut() = StatusCode::BAD_REQUEST;
                          e
                      })?;
 
         if src == dst {
-            *res.status_mut() == StatusCode::Forbidden;
+            *res.status_mut() == StatusCode::FORBIDDEN;
             return Err(Error::BadPath);
         }
 
         Ok((src, dst))
     }
+    */
 
-    fn handle_propfind(&self,
-                       mut req: Request,
-                       mut res: Response<hyper::net::Fresh>)
-                       -> Result<(), Error> {
+    async fn handle_propfind(&self, req: Request<hyper::body::Incoming>)
+                       -> Result<Response<Full<Bytes>>, Infallible> {
+        
         // Get the file
-        let path = self.uri_to_path(&req, &mut res)?;
+        let path = self.uri_to_path(&req);
 
         // Get the depth
-        let depth = req.headers
-            .get_raw("Depth")
-            .and_then(|vec| vec.get(0))
+        let depth = req.headers()
+            .get("Depth")
+            .and_then(|vec| Some(vec.as_bytes()))
             .and_then(|vec| std::str::from_utf8(vec).ok())
             .and_then(|s| s.parse::<u32>().ok())
             .unwrap_or(0);
 
-        let xml = xml::reader::EventReader::new_with_config(&mut req,
-                                                            ParserConfig {
-                                                                trim_whitespace: true,
-                                                                ..Default::default()
-                                                            });
+        let parse_config = ParserConfig {
+            trim_whitespace: true,
+            ..Default::default()
+        };
+        let body_buf = req.collect().await.unwrap().aggregate();
+        let mut body_reader = body_buf.reader();
+
+        let xml = xml::reader::EventReader::new_with_config(&mut body_reader,
+            parse_config);
         let mut props = Vec::new();
         if let Err(e) = parse_propfind(xml, |prop| { props.push(prop); }) {
-            *res.status_mut() = StatusCode::BadRequest;
-            return Err(e);
+            let mut res = Response::new(Full::new(Bytes::from(BAD_REQUEST)));
+            *res.status_mut() = StatusCode::NOT_FOUND;
+            return Ok(res);
         }
 
         debug!("Propfind {:?} {:?}", path, props);
 
-        let meta = path.metadata()
-            .map_err(|e| io_error_to_status(e, &mut res))?;
-        *res.status_mut() = StatusCode::MultiStatus;
+        let res_build = Response::builder().status(StatusCode::MULTI_STATUS);
+        let meta = path.metadata().unwrap();
 
-        let mut xmlwriter = EventWriter::new_with_config(res.start()?,
+        let mut xmlwriter = EventWriter::new_with_config(Vec::new(),
                                                          EmitterConfig {
                                                              perform_indent: true,
                                                              ..Default::default()
@@ -498,54 +531,95 @@ impl Server {
                        version: XmlVersion::Version10,
                        encoding: Some("utf-8"),
                        standalone: None,
-                   })?;
+                   }).unwrap();
         xmlwriter
-            .write(XmlWEvent::start_element("D:multistatus").ns("D", "DAV:"))?;
+            .write(XmlWEvent::start_element("D:multistatus").ns("D", "DAV:")).unwrap();
 
-        handle_propfind_path(&mut xmlwriter,
+        let _ = handle_propfind_path(&mut xmlwriter, &path,
                              &self.serverpath.file_to_url(&path),
                              &meta,
-                             &props)?;
+                             &props);
 
         if meta.is_dir() {
-            self.handle_propfind_path_recursive(&path, depth, &mut xmlwriter, &props)?;
+            self.handle_propfind_path_recursive(&path, depth, &mut xmlwriter, &props).unwrap();
         }
 
-        xmlwriter.write(XmlWEvent::end_element())?;
-        Ok(())
+        xmlwriter.write(XmlWEvent::end_element()).unwrap();
+        let xlm_body = xmlwriter.into_inner();
+
+        let xlm_body2 = xlm_body.clone();
+        let xlm_body_str = String::from_utf8(xlm_body2).unwrap();
+        debug!("==== Propfind Resonse start ====\n");
+        debug!("{}", xlm_body_str);
+        debug!("==== Propfind Resonse End ====\n");
+        
+        let res_result = res_build.body(
+            Full::new(Bytes::from(xlm_body))
+        ).unwrap();
+        Ok(res_result)
     }
 
-    fn handle_get(&self, req: Request, mut res: Response<hyper::net::Fresh>) -> Result<(), Error> {
+    
+    async fn handle_get(&self, req: Request<hyper::body::Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {
         // Get the file
-        let path = self.uri_to_path(&req, &mut res)?;
-        let mut file = File::open(path)
-            .map_err(|e| io_error_to_status(e, &mut res))?;
+        let path = self.uri_to_path(&req);
+        debug!("Get path {:?}", path);
+        
+        let f = File::open(&path);
+        let mut file = match f {
+            Ok(file) => file,
+            Err(e) => {
+                return io_error_to_status(e);
+            },
+        };
+        
         let size = file.metadata()
             .map(|m| m.len())
-            .map_err(|e| io_error_to_status(e, &mut res))?;
+            .map_err(|e| io_error_to_status(e)).unwrap();
+
+        // let mut contents = String::new();
+        let mut contents = Vec::new();
+        // TODO: byte ranges (Accept-Ranges: bytes)
+
+        let read_size = file.read_to_end(&mut contents).unwrap();
+
+        let mut res = Response::builder().status(StatusCode::INTERNAL_SERVER_ERROR)
+            .body(Full::new(Bytes::from(contents)))
+            .unwrap();
+        let hadermap = res.headers_mut();
 
         // Ignore size = 0 to hopefully work reasonably with special files
         if size > 0 {
-            res.headers_mut().set(ContentLength(size))
+            hadermap.insert(hyper::header::CONTENT_LENGTH, hyper::header::HeaderValue::from(size));
         }
+        let guess = mime_guess::from_path(path).first().unwrap();
+        let mut context_type = guess.type_().as_str().to_string();
+        context_type.push('/');
+        context_type.push_str(guess.subtype().as_str());
+        if guess.type_().as_str().to_string().eq("text"){
+            context_type.push_str("; charset=utf-8");
+        }
+        hadermap.insert(hyper::header::CONTENT_TYPE, hyper::header::HeaderValue::from_str(
+            &context_type
+        ).unwrap());
 
-        // TODO: byte ranges (Accept-Ranges: bytes)
-        io::copy(&mut file, &mut res.start()?)?;
-        Ok(())
+        return Ok(res);
+
     }
 
+    /*
     fn handle_put(&self,
-                  mut req: Request,
-                  mut res: Response<hyper::net::Fresh>)
+                  mut req: Request<hyper::body::Incoming>,
+                  mut res: Response<BoxBody<Bytes, hyper::Error>>)
                   -> Result<(), Error> {
-        let path = self.uri_to_path(&req, &mut res)?;
+        let path = self.uri_to_path(&req);
         let mut file = File::create(path)
             .map_err(|e| io_error_to_status(e, &mut res))?;
         io::copy(&mut req, &mut file)?;
         Ok(())
     }
 
-    fn handle_copy(&self, req: Request, mut res: Response<hyper::net::Fresh>) -> Result<(), Error> {
+    fn handle_copy(&self, req: Request<hyper::body::Incoming>, mut res: Response<BoxBody<Bytes, hyper::Error>>) -> Result<(), Error> {
         let (src, dst) = self.uri_to_src_dst(&req, &mut res)?;
         debug!("Copy {:?} -> {:?}", src, dst);
 
@@ -553,27 +627,27 @@ impl Server {
         // TODO: proper error for out of space
         fs::copy(src, dst)
             .map_err(|e| io_error_to_status(e, &mut res))?;
-        *res.status_mut() == StatusCode::Created;
+        *res.status_mut() == StatusCode::CREATED;
         Ok(())
     }
 
-    fn handle_move(&self, req: Request, mut res: Response<hyper::net::Fresh>) -> Result<(), Error> {
+    fn handle_move(&self, req: Request<hyper::body::Incoming>, mut res: Response<BoxBody<Bytes, hyper::Error>>) -> Result<(), Error> {
         let (src, dst) = self.uri_to_src_dst(&req, &mut res)?;
         debug!("Move {:?} -> {:?}", src, dst);
 
         // TODO: handle overwrite flags
         fs::rename(src, dst)
             .map_err(|e| io_error_to_status(e, &mut res))?;
-        *res.status_mut() == StatusCode::Created;
+        *res.status_mut() == StatusCode::CREATED;
         Ok(())
     }
 
     fn handle_delete(&self,
-                     req: Request,
-                     mut res: Response<hyper::net::Fresh>)
+                     req: Request<hyper::body::Incoming>,
+                     mut res: Response<BoxBody<Bytes, hyper::Error>>)
                      -> Result<(), Error> {
         // Get the file
-        let path = self.uri_to_path(&req, &mut res)?;
+        let path = self.uri_to_path(&req);
         let meta = path.metadata()
             .map_err(|e| io_error_to_status(e, &mut res))?;
         if meta.is_dir() {
@@ -586,64 +660,92 @@ impl Server {
     }
 
     fn handle_mkdir(&self,
-                    req: Request,
-                    mut res: Response<hyper::net::Fresh>)
+                    req: Request<hyper::body::Incoming>,
+                    mut res: Response<BoxBody<Bytes, hyper::Error>>)
                     -> Result<(), Error> {
-        let path = self.uri_to_path(&req, &mut res)?;
+        let path = self.uri_to_path(&req);
         let ret = fs::create_dir(path);
         match ret {
-            Ok(_) => *res.status_mut() = StatusCode::Created,
+            Ok(_) => *res.status_mut() = StatusCode::CREATED,
             Err(ref e) if e.kind() == ErrorKind::NotFound => {
-                *res.status_mut() = StatusCode::Conflict;
+                *res.status_mut() = StatusCode::CONFLICT;
             }
-            Err(_) => *res.status_mut() = StatusCode::InternalServerError,
+            Err(_) => *res.status_mut() = StatusCode::INTERNAL_SERVER_ERROR,
         };
         ret.map_err(Into::into)
     }
+    */
 }
 
-impl Handler for Server {
-    fn handle<'a, 'k>(&'a self, req: Request<'a, 'k>, mut res: Response<'a, hyper::net::Fresh>) {
-        debug!("Request {:?}", req.method);
 
-        let reqtype = match req.method {
-            Method::Options => RequestType::Options,
-            Method::Get => RequestType::Get,
-            Method::Put => RequestType::Put,
-            Method::Delete => RequestType::Delete,
-            Method::Extension(ref s) if s == "PROPFIND" => RequestType::Propfind,
-            Method::Extension(ref s) if s == "COPY" => RequestType::Copy,
-            Method::Extension(ref s) if s == "MOVE" => RequestType::Move,
-            Method::Extension(ref s) if s == "MKCOL" => RequestType::Mkdir,
-            _ => {
-                *res.status_mut() = StatusCode::BadRequest;
-                return;
-            }
-        };
+fn empty() -> Full<Bytes>{
+    let emp = Full::new(Bytes::from(""));
+    return emp;
+}
 
-        if let Err(e) = match reqtype {
-               RequestType::Options => {
-                   res.headers_mut()
-                       .set(hyper::header::Allow(vec![Method::Options,
-                                                      Method::Get,
-                                                      Method::Put,
-                                                      Method::Delete,
-                                                      Method::Extension("PROPFIND".into()),
-                                                      Method::Extension("COPY".into()),
-                                                      Method::Extension("MOVE".into()),
-                                                      Method::Extension("MKCOL".into())]));
-                   res.headers_mut().set_raw("DAV", vec![b"1".to_vec()]);
-                   Ok(())
-               }
-               RequestType::Propfind => self.handle_propfind(req, res),
-               RequestType::Get => self.handle_get(req, res),
-               RequestType::Put => self.handle_put(req, res),
-               RequestType::Copy => self.handle_copy(req, res),
-               RequestType::Move => self.handle_move(req, res),
-               RequestType::Delete => self.handle_delete(req, res),
-               RequestType::Mkdir => self.handle_mkdir(req, res),
-           } {
-            error!("Request error {:?}", e)
+pub async fn handle(server:&Server, req: Request<hyper::body::Incoming>) -> Result<Response<Full<Bytes>>, Infallible>{
+// Result<Response<BoxBody>>  {
+    debug!("Request {:?}", req.method());
+    
+
+    let reqtype = match req.method().as_str().to_uppercase().as_str(){
+        "OPTIONS" => RequestType::Options,
+        "GET" => RequestType::Get,
+        "PUT" => RequestType::Put,
+        "DELETE" => RequestType::Delete,
+        "PROPFIND" => RequestType::Propfind,
+        "COPY" => RequestType::Copy,
+        "MOVE" => RequestType::Move,
+        "MKCOL" => RequestType::Mkdir,
+        _ => {
+
+            let mut res = Response::new(Full::new(Bytes::from(BAD_REQUEST)));
+            *res.status_mut() = StatusCode::NOT_FOUND;
+            return Ok(res);
         }
-    }
+    };
+
+    let res_build = Response::builder();
+
+    let result_res = match reqtype {
+        RequestType::Options => {
+            let mut res = res_build.status(200)
+                .body(())
+                .unwrap();
+            let hadermap = res.headers_mut();
+            hadermap.insert(
+                hyper::header::ALLOW,
+                hyper::header::HeaderValue::from_str("OPTIONS,GET,PUT,DELETE,PROPFIND,COPY,MOVE").unwrap()
+            );
+            hadermap.insert("DAV", hyper::header::HeaderValue::from_str("1").unwrap());
+
+            let r = Response::new(Full::new(Bytes::from("")));
+            let r2:  Result<Response<Full<Bytes>>, Infallible> = Ok(r);
+            r2
+        }
+        RequestType::Propfind =>{
+            server.handle_propfind(req).await
+        }
+        RequestType::Get => {
+            server.handle_get(req).await
+        },
+        // RequestType::Put => server.handle_put(req, res),
+        // RequestType::Copy => server.handle_copy(req, res),
+        // RequestType::Move => server.handle_move(req, res),
+        // RequestType::Delete => server.handle_delete(req, res),
+        // RequestType::Mkdir => server.handle_mkdir(req, res),
+        _=>{
+            error!("Request error");
+            let mut res = Response::new(Full::new(Bytes::from(BAD_REQUEST)));
+            *res.status_mut() = StatusCode::NOT_FOUND;
+            return Ok(res);
+        }
+    };
+    
+    //result_res
+    return result_res;
+
+    // let response = Response::new(Full::new(Bytes::from("Hello World!")));
+    // Ok(response)
 }
+
