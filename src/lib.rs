@@ -11,6 +11,7 @@
 //!```
 //! 
 
+use futures;
 use std::convert::Infallible;
 use bytes::{Bytes, Buf};
 
@@ -416,6 +417,11 @@ fn make_error_res(status_code:StatusCode)-> Response<BoxBody<Bytes, std::io::Err
     return res_builder.unwrap();
 }
 
+// https://stackoverflow.com/a/63651544/6652082
+fn to_tokio_async_read(r: impl futures::io::AsyncRead) -> impl tokio::io::AsyncRead {
+    tokio_util::compat::FuturesAsyncReadCompatExt::compat(r)
+}
+
 impl Server {
     fn handle_propfind_path_recursive<W: Write>(&self,
                                                 path: &Path,
@@ -580,7 +586,6 @@ impl Server {
 
     
     async fn handle_get(&self, req: Request<hyper::body::Incoming>) 
-            // -> Result<Response<Full<Bytes>>, Infallible> {
             -> Response<BoxBody<Bytes, std::io::Error>>{
         // Get the file
         let path = self.uri_to_path(&req);
@@ -588,7 +593,7 @@ impl Server {
         
         let file = tokio::fs::File::open(path.clone()).await;
         if file.is_err() {
-            eprintln!("ERROR: Unable to open file.");
+            error!("ERROR: Unable to open file.");
             return make_error_res(StatusCode::NOT_FOUND);
             
         }
@@ -631,18 +636,29 @@ impl Server {
         return res;
 
     }
-
-    /*
-    fn handle_put(&self,
-                  mut req: Request<hyper::body::Incoming>,
-                  mut res: Response<BoxBody<Bytes, hyper::Error>>)
-                  -> Result<(), Error> {
+    
+    async fn handle_put(&self, mut req: Request<hyper::body::Incoming>)
+                  -> Response<BoxBody<Bytes, std::io::Error>>{
         let path = self.uri_to_path(&req);
-        let mut file = File::create(path)
-            .map_err(|e| io_error_to_status(e, &mut res))?;
-        io::copy(&mut req, &mut file)?;
-        Ok(())
+        let file = File::create(path);
+        if file.is_err() {
+            error!("ERROR: Unable to open file.");
+            return make_error_res(StatusCode::NOT_FOUND);
+        }
+        let mut file = file.unwrap();
+        let whole_body = req.collect().await.unwrap();
+        let buf = whole_body.to_bytes();
+        //whole_body.
+
+        let _ = file.write_all(&buf);
+
+        let res = Response::builder()
+            .status(StatusCode::OK)
+            .body(Full::new("".into()).map_err(|e| match e {}).boxed())
+            .unwrap();       
+        return res;
     }
+    /*
 
     fn handle_copy(&self, req: Request<hyper::body::Incoming>, mut res: Response<BoxBody<Bytes, hyper::Error>>) -> Result<(), Error> {
         let (src, dst) = self.uri_to_src_dst(&req, &mut res)?;
@@ -760,7 +776,9 @@ pub async fn handle(server:&Server, req: Request<hyper::body::Incoming>)
         RequestType::Get => {
             server.handle_get(req).await
         },
-        // RequestType::Put => server.handle_put(req, res),
+        RequestType::Put => {
+            server.handle_put(req).await
+        },
         // RequestType::Copy => server.handle_copy(req, res),
         // RequestType::Move => server.handle_move(req, res),
         // RequestType::Delete => server.handle_delete(req, res),
