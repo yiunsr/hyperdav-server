@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 use log::{error, debug};
 
 use percent_encoding::percent_decode;
+use percent_encoding::percent_encode_byte;
 use http_body_util::{combinators::BoxBody, BodyExt, Full, StreamBody};
 use hyper::body::Frame;
 use hyper::{Request, Response};
@@ -70,10 +71,12 @@ impl ServerPath {
         let path = path.as_ref()
             .strip_prefix(&self.srv_root)
             .expect("file_to_url");
-        self.url_prefix.clone().into_owned() + "/" + path.to_str().expect("file_to_url")
+        let url = self.url_prefix.clone().into_owned() + "/" + path.to_str().expect("file_to_url");
+        url.bytes().map(percent_encode_byte).collect::<String>()
     }
 
     fn url_to_file<'a>(&'a self, url: &'a str) -> Option<PathBuf> {
+        debug!("url_to_file url : {}", url);
         if url.starts_with(self.url_prefix.borrow() as &str) {
             let subpath = &url[self.url_prefix.len()..]
                                .trim_start_matches("/")
@@ -412,6 +415,7 @@ fn make_error_res(status_code:StatusCode)-> Response<BoxBody<Bytes, std::io::Err
     let res_builder = match status_code{
         StatusCode::INTERNAL_SERVER_ERROR => res_builder.body(Full::new(INTERNAL_SERVER_ERROR.into()).map_err(|e| match e {}).boxed()),
         StatusCode::NOT_FOUND => res_builder.body(Full::new(NOTFOUND.into()).map_err(|e| match e {}).boxed()),
+        StatusCode::BAD_REQUEST => res_builder.body(Full::new(BAD_REQUEST.into()).map_err(|e| match e {}).boxed()),
         _ => res_builder.body(Full::new(INTERNAL_SERVER_ERROR.into()).map_err(|e| match e {}).boxed()),
     };
     return res_builder.unwrap();
@@ -469,46 +473,36 @@ impl Server {
         return full_path;
     }
 
-    /*
+    
     fn uri_to_src_dst(&self,
-                      req: &Request<hyper::body::Incoming>,
-                      res: &mut Response<BoxBody<Bytes, hyper::Error>>)
+                      req: &Request<hyper::body::Incoming>)
                       -> Result<(PathBuf, PathBuf), Error> {
         // Get the source
-        let src = self.uri_to_path(req);
-
+        let src: PathBuf = self.uri_to_path(req);
+        
         // Get the destination
         let dst = req.headers()
             .get("Destination")
             .and_then(|vec| Some(vec.as_bytes()))
             .and_then(|vec| std::str::from_utf8(vec).ok())
             .and_then(|s| url::Url::parse(s).ok())
-            .ok_or(Error::BadPath)
-            .map_err(|e| {
-                         *res.status_mut() = StatusCode::BAD_REQUEST;
-                         e
-                     })?;
-        let dst = url::percent_encoding::percent_decode(dst.path().as_bytes())
+            .ok_or(Error::BadPath)?;
+        let dst = percent_decode(dst.to_string().as_bytes())
             .decode_utf8()
             .map_err(|_| Error::BadPath)
             .and_then(|dst| {
                           self.serverpath
                               .url_to_file(dst.borrow())
                               .ok_or(Error::BadPath)
-                      })
-            .map_err(|e| {
-                         *res.status_mut() = StatusCode::BAD_REQUEST;
-                         e
-                     })?;
+                      })?;
 
         if src == dst {
-            *res.status_mut() == StatusCode::FORBIDDEN;
             return Err(Error::BadPath);
         }
 
         Ok((src, dst))
     }
-    */
+    
 
     async fn handle_propfind(&self, req: Request<hyper::body::Incoming>)
                         -> Response<BoxBody<Bytes, std::io::Error>>{
@@ -658,19 +652,34 @@ impl Server {
             .unwrap();       
         return res;
     }
-    /*
 
-    fn handle_copy(&self, req: Request<hyper::body::Incoming>, mut res: Response<BoxBody<Bytes, hyper::Error>>) -> Result<(), Error> {
-        let (src, dst) = self.uri_to_src_dst(&req, &mut res)?;
+    async fn handle_copy(&self, req: Request<hyper::body::Incoming>)
+            -> Response<BoxBody<Bytes, std::io::Error>>{
+        let result_path = self.uri_to_src_dst(&req);
+        if result_path.is_err() {
+            error!("ERROR: Unable to open file.");
+            return make_error_res(StatusCode::NOT_FOUND);
+        }
+        let (src, dst) = result_path.unwrap();
         debug!("Copy {:?} -> {:?}", src, dst);
 
         // TODO: handle overwrite flags and directory copies
         // TODO: proper error for out of space
-        fs::copy(src, dst)
-            .map_err(|e| io_error_to_status(e, &mut res))?;
-        *res.status_mut() == StatusCode::CREATED;
-        Ok(())
+        let ret_copy = std::fs::copy(src, dst);
+        if ret_copy.is_err() {
+            let err = ret_copy.unwrap_err();
+            error!("ERROR: Unable to copy file.");
+            return make_error_res(StatusCode::BAD_REQUEST);
+        }
+        
+        let res = Response::builder()
+            .status(StatusCode::CREATED)
+            .body(Full::new("".into()).map_err(|e| match e {}).boxed())
+            .unwrap();       
+        return res;
     }
+
+    /*
 
     fn handle_move(&self, req: Request<hyper::body::Incoming>, mut res: Response<BoxBody<Bytes, hyper::Error>>) -> Result<(), Error> {
         let (src, dst) = self.uri_to_src_dst(&req, &mut res)?;
@@ -763,9 +772,9 @@ pub async fn handle(server:&Server, req: Request<hyper::body::Incoming>)
             );
             hadermap.insert("DAV", hyper::header::HeaderValue::from_str("1").unwrap());
 
-            let mut res = Response::builder()
-                .status(StatusCode::BAD_REQUEST)
-                .body(Full::new(BAD_REQUEST.into()).map_err(|e| match e {}).boxed())
+            let res = Response::builder()
+                .status(StatusCode::OK)
+                .body(Full::new("".into()).map_err(|e| match e {}).boxed())
                 .unwrap();
             return Ok(res);
             
@@ -779,7 +788,9 @@ pub async fn handle(server:&Server, req: Request<hyper::body::Incoming>)
         RequestType::Put => {
             server.handle_put(req).await
         },
-        // RequestType::Copy => server.handle_copy(req, res),
+        RequestType::Copy => {
+            server.handle_copy(req).await
+        },
         // RequestType::Move => server.handle_move(req, res),
         // RequestType::Delete => server.handle_delete(req, res),
         // RequestType::Mkdir => server.handle_mkdir(req, res),
