@@ -657,7 +657,7 @@ impl Server {
             -> Response<BoxBody<Bytes, std::io::Error>>{
         let result_path = self.uri_to_src_dst(&req);
         if result_path.is_err() {
-            error!("ERROR: Unable to open file.");
+            error!("ERROR: Unable to copy file.");
             return make_error_res(StatusCode::NOT_FOUND);
         }
         let (src, dst) = result_path.unwrap();
@@ -679,19 +679,32 @@ impl Server {
         return res;
     }
 
-    /*
-
-    fn handle_move(&self, req: Request<hyper::body::Incoming>, mut res: Response<BoxBody<Bytes, hyper::Error>>) -> Result<(), Error> {
-        let (src, dst) = self.uri_to_src_dst(&req, &mut res)?;
+    async fn handle_move(&self, req: Request<hyper::body::Incoming>)
+            -> Response<BoxBody<Bytes, std::io::Error>>{
+        let result_path = self.uri_to_src_dst(&req);
+        if result_path.is_err() {
+            error!("ERROR: Unable to copy file.");
+            return make_error_res(StatusCode::NOT_FOUND);
+        }
+        let (src, dst) = result_path.unwrap();
         debug!("Move {:?} -> {:?}", src, dst);
 
         // TODO: handle overwrite flags
-        fs::rename(src, dst)
-            .map_err(|e| io_error_to_status(e, &mut res))?;
-        *res.status_mut() == StatusCode::CREATED;
-        Ok(())
+        let ret_copy = std::fs::rename(src, dst);
+        if ret_copy.is_err() {
+            let err = ret_copy.unwrap_err();
+            error!("ERROR: Unable to copy file.");
+            return make_error_res(StatusCode::BAD_REQUEST);
+        }
+        
+        let res = Response::builder()
+            .status(StatusCode::CREATED)
+            .body(Full::new("".into()).map_err(|e| match e {}).boxed())
+            .unwrap();       
+        return res;
     }
 
+    /*
     fn handle_delete(&self,
                      req: Request<hyper::body::Incoming>,
                      mut res: Response<BoxBody<Bytes, hyper::Error>>)
@@ -791,7 +804,7 @@ pub async fn handle(server:&Server, req: Request<hyper::body::Incoming>)
         RequestType::Copy => {
             server.handle_copy(req).await
         },
-        // RequestType::Move => server.handle_move(req, res),
+        RequestType::Move => server.handle_move(req).await,
         // RequestType::Delete => server.handle_delete(req, res),
         // RequestType::Mkdir => server.handle_mkdir(req, res),
         _=>{
