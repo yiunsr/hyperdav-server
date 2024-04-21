@@ -727,23 +727,23 @@ impl Server {
         return res;
     }
 
-    /*
-    fn handle_mkdir(&self,
-                    req: Request<hyper::body::Incoming>,
-                    mut res: Response<BoxBody<Bytes, hyper::Error>>)
-                    -> Result<(), Error> {
+    async fn handle_mkdir(&self, req: Request<hyper::body::Incoming>)
+            -> Response<BoxBody<Bytes, std::io::Error>>{
         let path = self.uri_to_path(&req);
-        let ret = fs::create_dir(path);
-        match ret {
-            Ok(_) => *res.status_mut() = StatusCode::CREATED,
+        let ret = std::fs::create_dir(path);
+        let status = match ret {
+            Ok(_) => StatusCode::CREATED,
             Err(ref e) if e.kind() == ErrorKind::NotFound => {
-                *res.status_mut() = StatusCode::CONFLICT;
+                StatusCode::CONFLICT
             }
-            Err(_) => *res.status_mut() = StatusCode::INTERNAL_SERVER_ERROR,
+            Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
-        ret.map_err(Into::into)
+        let res = Response::builder()
+            .status(status)
+            .body(Full::new("".into()).map_err(|e| match e {}).boxed())
+            .unwrap();       
+        return res;
     }
-    */
 }
 
 
@@ -816,7 +816,9 @@ pub async fn handle(server:&Server, req: Request<hyper::body::Incoming>)
         RequestType::Delete => {
             server.handle_delete(req).await
         },
-        // RequestType::Mkdir => server.handle_mkdir(req, res),
+        RequestType::Mkdir => {
+            server.handle_mkdir(req).await
+        },
         _=>{
             error!("Request error");
 
