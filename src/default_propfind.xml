@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<propfind xmlns="DAV:">
+  <prop>
+    <creationdate/>
+    <displayname/>
+    <getcontentlength/>
+    <getcontenttype/>
+    <getetag/>
+    <getlastmodified/>
+    <lockdiscovery/>
+    <supportedlock/>
+    <resourcetype/>
+    <s:lastmodified_server xmlns:s="SAR:"/><s:lastmodified xmlns:s="SAR:"/>
+  </prop>
+</propfind>

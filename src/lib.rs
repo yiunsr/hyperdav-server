@@ -13,6 +13,7 @@
 
 use futures;
 use bytes::{Bytes, Buf};
+use http_body::Body;
 
 use std::borrow::{Borrow, Cow};
 use std::time::{UNIX_EPOCH, SystemTime};
@@ -22,7 +23,7 @@ use std::path::{Path, PathBuf};
 use log::{error, debug};
 
 use percent_encoding::percent_decode;
-use percent_encoding::percent_encode_byte;
+
 use http_body_util::{combinators::BoxBody, BodyExt, Full, StreamBody};
 use hyper::body::Frame;
 use hyper::{Request, Response};
@@ -253,7 +254,7 @@ fn systime_to_format(time: SystemTime) -> String {
 
     let unix = time.duration_since(UNIX_EPOCH).unwrap();
     let time: DateTime<Utc> = DateTime::from_timestamp(unix.as_secs() as i64, unix.subsec_nanos()).unwrap();
-    time.to_rfc3339()
+    time.to_rfc3339_opts(chrono::format::SecondsFormat::Secs, true)
 }
 
 fn handle_prop_path<W: Write>(xmlwriter: &mut EventWriter<W>, path: &PathBuf, url: &str,
@@ -326,6 +327,18 @@ fn handle_prop_path<W: Write>(xmlwriter: &mut EventWriter<W>, path: &PathBuf, ur
                 .write(XmlWEvent::start_element("D:getetag"))?;
             xmlwriter
                 .write(XmlWEvent::characters(&etag))?;
+            xmlwriter.write(XmlWEvent::end_element())?;
+            Ok(true)
+        }
+        (Some("DAV:"), "lockdiscovery") => {
+            xmlwriter
+                .write(XmlWEvent::start_element("D:lockdiscovery"))?;
+            xmlwriter.write(XmlWEvent::end_element())?;
+            Ok(true)
+        }
+        (Some("DAV:"), "supportedlock") => {
+            xmlwriter
+                .write(XmlWEvent::start_element("D:supportedlock"))?;
             xmlwriter.write(XmlWEvent::end_element())?;
             Ok(true)
         }
@@ -510,10 +523,24 @@ impl Server {
 
     async fn handle_propfind(&self, req: Request<hyper::body::Incoming>)
                         -> Response<BoxBody<Bytes, std::io::Error>>{
+
+        // let res_sample = include_bytes!("sample01.xml");
+        // let res = Response::builder()
+        //         .status(StatusCode::MULTI_STATUS)
+        //         .body(Full::new(Bytes::from(Bytes::from(&res_sample[..]))).map_err(|e| match e {}).boxed())
+        //         .unwrap();
+        // return res;
         
         // Get the file
         let path = self.uri_to_path(&req);
         debug!("Propfind {:?}", path);
+
+        let header_map = req.headers();
+        for (key, header_value ) in header_map{
+            debug!("header : {}", key);
+            let value = std::str::from_utf8(header_value.as_bytes());
+            debug!("value : {:?}", value.unwrap());
+        }
 
         // Get the depth
         let depth = req.headers()
@@ -527,13 +554,28 @@ impl Server {
             trim_whitespace: true,
             ..Default::default()
         };
-        let body_buf = req.collect().await.unwrap().aggregate();
+        let whole_body = req.collect().await.unwrap();
+        // debug!("==== body start =====");
+        // debug!{"{:?}", whole_body};
+        // debug!("==== body end =====");
+
+        let body_buf = whole_body.aggregate();
+        let has_remaining = body_buf.has_remaining();
         let mut body_reader = body_buf.reader();
 
-        let xml = xml::reader::EventReader::new_with_config(&mut body_reader,
-            parse_config);
+        //// body에 전달되는 xml 이 없는 경우, 기본 사항을 response 한다.
+        if has_remaining == false {
+            let default_propfind = include_bytes!("default_propfind.xml");
+            let new_body = Full::new(Bytes::from(&default_propfind[..]));
+            let buffered = new_body.collect().await.unwrap();
+            body_reader = buffered.aggregate().reader();
+        }
+        
+        let xml = xml::reader::EventReader::new_with_config(&mut body_reader, parse_config);  
         let mut props = Vec::new();
+
         if let Err(e) = parse_propfind(xml, |prop| { props.push(prop); }) {
+            error!("Propfind error {:?}", e);
             let res = Response::builder()
                 .status(StatusCode::BAD_REQUEST)
                 .body(Full::new(BAD_REQUEST.into()).map_err(|e| match e {}).boxed())
@@ -542,7 +584,17 @@ impl Server {
         }
 
         debug!("Propfind {:?} {:?}", path, props);
-        let meta = path.metadata().unwrap();
+        let meta_result = path.metadata();
+        if meta_result.is_err(){
+            error!("Propfind error No meta");
+            let res = Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(Full::new(BAD_REQUEST.into()).map_err(|e| match e {}).boxed())
+                .unwrap();
+            return res;
+        }
+
+        let meta = meta_result.unwrap();
         let mut xmlwriter = EventWriter::new_with_config(Vec::new(),
                                                          EmitterConfig {
                                                              perform_indent: true,
@@ -577,7 +629,7 @@ impl Server {
         
 
         let res = Response::builder()
-                .status(StatusCode::OK)
+                .status(StatusCode::MULTI_STATUS)
                 .body(Full::new(Bytes::from(xlm_body)).map_err(|e| match e {}).boxed())
                 .unwrap();
         return res;
@@ -777,7 +829,7 @@ pub async fn handle(server:&Server, req: Request<hyper::body::Incoming>)
 
     let res_build = Response::builder();
 
-    let result_res = match reqtype {
+    let mut result_res = match reqtype {
         RequestType::Options => {
             let mut res = res_build.status(200)
                 .body(())
@@ -826,6 +878,14 @@ pub async fn handle(server:&Server, req: Request<hyper::body::Incoming>)
         //     return Ok(res);
         // }
     };
+
+    let hadermap = result_res.headers_mut();
+    hadermap.insert(hyper::header::CACHE_CONTROL, 
+        hyper::header::HeaderValue::from_str("no-cache").unwrap());
+    hadermap.insert(hyper::header::PRAGMA, 
+        hyper::header::HeaderValue::from_str("no-cache").unwrap());
+    // hadermap.insert(hyper::header::CONTENT_TYPE, 
+    //     hyper::header::HeaderValue::from_str("text/xml; charset=\"utf-8\"").unwrap());
     
     return Ok(result_res);
 }

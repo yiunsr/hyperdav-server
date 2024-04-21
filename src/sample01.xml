@@ -1,18 +1,18 @@
 <?xml version="1.0" encoding="utf-8"?>
 <D:multistatus xmlns:D="DAV:">
   <D:response>
-    <D:href>http://127.0.0.1:8008/</D:href>
+    <D:href>/</D:href>
     <D:propstat>
       <D:prop>
-        <D:creationdate>2024-04-06T02:45:09.039164200+00:00</D:creationdate>
-        <D:displayname>server_res</D:displayname>
-        <D:getcontentlength>4096</D:getcontentlength>
+        <D:creationdate>2024-04-06T02:45:09Z</D:creationdate>
         <D:getcontenttype>httpd/unix-directory</D:getcontenttype>
         <D:getetag>61698b690fcbf</D:getetag>
-        <D:getlastmodified>2024-04-21T10:23:34.059199500+00:00</D:getlastmodified>
+        <D:getlastmodified>Sun, 21 Apr 2024 10:23:34 GMT</D:getlastmodified>
+        <D:lockdiscovery />
         <D:resourcetype>
-          <D:collection />
+          <D:collection></D:collection>
         </D:resourcetype>
+        <D:supportedlock />
       </D:prop>
       <D:status>HTTP/1.1 200 OK</D:status>
     </D:propstat>

@@ -25,10 +25,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env::set_var("RUST_BACKTRACE", "full");
     env_logger::Builder::new().filter_level(log::LevelFilter::max()).init();
 
-    let addr: SocketAddr = ([127, 0, 0, 1], 9091).into();
+    let addr: SocketAddr = ([127, 0, 0, 1], 7087).into();
     
     let root_dir = r"D:\workspace\vscode3\server_res";
-    let dav_server = hyperdav_server::Server::new("http://127.0.0.1:9091", Path::new(root_dir));
+    let dav_server = hyperdav_server::Server::new("http://127.0.0.1:7087", Path::new(root_dir));
     let listener = TcpListener::bind(addr).await?;
     println!("Listening on http://{}", addr);
     loop {
