@@ -12,7 +12,6 @@
 //! 
 
 use futures;
-use std::convert::Infallible;
 use bytes::{Bytes, Buf};
 
 use std::borrow::{Borrow, Cow};
@@ -72,6 +71,10 @@ impl ServerPath {
             .strip_prefix(&self.srv_root)
             .expect("file_to_url");
         let url = self.url_prefix.clone().into_owned() + "/" + path.to_str().expect("file_to_url");
+
+        // space to "%20" encoding
+        // 최소한의 url encoding만 해준다.
+        let url = url.replace(" ", "%20");
         return url;
         // url.bytes().map(percent_encode_byte).collect::<String>()
     }
@@ -510,6 +513,7 @@ impl Server {
         
         // Get the file
         let path = self.uri_to_path(&req);
+        debug!("Propfind {:?}", path);
 
         // Get the depth
         let depth = req.headers()
@@ -669,7 +673,7 @@ impl Server {
         let ret_copy = std::fs::copy(src, dst);
         if ret_copy.is_err() {
             let err = ret_copy.unwrap_err();
-            error!("ERROR: Unable to copy file.");
+            error!("ERROR: Unable to copy file. {:?}", err);
             return make_error_res(StatusCode::BAD_REQUEST);
         }
         
@@ -694,7 +698,7 @@ impl Server {
         let ret_copy = std::fs::rename(src, dst);
         if ret_copy.is_err() {
             let err = ret_copy.unwrap_err();
-            error!("ERROR: Unable to copy file.");
+            error!("ERROR: Unable to copy file. , {:?}", err);
             return make_error_res(StatusCode::BAD_REQUEST);
         }
         
@@ -744,12 +748,6 @@ impl Server {
             .unwrap();       
         return res;
     }
-}
-
-
-fn empty() -> Full<Bytes>{
-    let emp = Full::new(Bytes::from(""));
-    return emp;
 }
 
 pub async fn handle(server:&Server, req: Request<hyper::body::Incoming>) 
@@ -819,21 +817,16 @@ pub async fn handle(server:&Server, req: Request<hyper::body::Incoming>)
         RequestType::Mkdir => {
             server.handle_mkdir(req).await
         },
-        _=>{
-            error!("Request error");
-
-            let mut res = Response::builder()
-                .status(StatusCode::NOT_FOUND)
-                .body(Full::new(BAD_REQUEST.into()).map_err(|e| match e {}).boxed())
-                .unwrap();
-            return Ok(res);
-        }
+        // _=>{
+        //     error!("Request error");
+        //     let res = Response::builder()
+        //         .status(StatusCode::NOT_FOUND)
+        //         .body(Full::new(BAD_REQUEST.into()).map_err(|e| match e {}).boxed())
+        //         .unwrap();
+        //     return Ok(res);
+        // }
     };
     
-    //result_res
     return Ok(result_res);
-
-    // let response = Response::new(Full::new(Bytes::from("Hello World!")));
-    // Ok(response)
 }
 
