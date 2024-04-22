@@ -14,6 +14,7 @@
 use futures;
 use bytes::{Bytes, Buf};
 use http_body::Body;
+use url::Url;
 
 use std::borrow::{Borrow, Cow};
 use std::time::{UNIX_EPOCH, SystemTime};
@@ -362,9 +363,11 @@ fn handle_propfind_path<W: Write>(xmlwriter: &mut EventWriter<W>, path: &PathBuf
             meta: &Metadata, props: &[OwnedName])-> Result<(), Error> {
     xmlwriter.write(XmlWEvent::start_element("D:response"))?;
 
-    debug!("href : {}", url);
+    let pathname = Url::parse(url).unwrap();
+    let pathname = pathname.path();
+    debug!("pathname : {}", pathname);
     xmlwriter.write(XmlWEvent::start_element("D:href"))?;
-    xmlwriter.write(XmlWEvent::characters(url))?;
+    xmlwriter.write(XmlWEvent::characters(pathname))?;
     xmlwriter.write(XmlWEvent::end_element())?; // href
 
     let mut failed_props = Vec::with_capacity(props.len());
