@@ -538,12 +538,12 @@ impl Server {
         let path = self.uri_to_path(&req);
         debug!("Propfind {:?}", path);
 
-        let header_map = req.headers();
-        for (key, header_value ) in header_map{
-            debug!("header : {}", key);
-            let value = std::str::from_utf8(header_value.as_bytes());
-            debug!("value : {:?}", value.unwrap());
-        }
+        // let header_map = req.headers();
+        // for (key, header_value ) in header_map{
+        //     debug!("header : {}", key);
+        //     let value = std::str::from_utf8(header_value.as_bytes());
+        //     debug!("value : {:?}", value.unwrap());
+        // }
 
         // Get the depth
         let depth = req.headers()
@@ -586,7 +586,7 @@ impl Server {
             return res;
         }
 
-        debug!("Propfind {:?} {:?}", path, props);
+        // debug!("Propfind {:?} {:?}", path, props);
         let meta_result = path.metadata();
         if meta_result.is_err(){
             error!("Propfind error No meta");

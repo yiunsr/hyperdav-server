@@ -2,6 +2,7 @@ use env_logger;
 use hyperdav_server;
 use std::net::SocketAddr;
 use std::path::Path;
+use std::io::Write;
 
 use tokio::net::TcpListener;
 use hyper_util::rt::tokio::TokioIo;
@@ -23,7 +24,18 @@ use hyper::service::service_fn;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use std::env;
     env::set_var("RUST_BACKTRACE", "full");
-    env_logger::Builder::new().filter_level(log::LevelFilter::max()).init();
+    env_logger::Builder::new()
+        .format(|buf, record| {
+            writeln!(
+                buf, "{}:{} {} [{}] - {}",
+                record.file().unwrap_or("unknown"),
+                record.line().unwrap_or(0),
+                chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+                record.level(),
+                record.args()
+            )
+        })
+        .filter_level(log::LevelFilter::max()).init();
 
     let addr: SocketAddr = ([127, 0, 0, 1], 9050).into();
     
