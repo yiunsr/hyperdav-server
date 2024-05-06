@@ -13,24 +13,27 @@
 
 use futures;
 use bytes::{Bytes, Buf};
-use http_body::Body;
 use url::Url;
 
+use std::convert::Infallible;
 use std::borrow::{Borrow, Cow};
+use std::str::FromStr;
 use std::time::{UNIX_EPOCH, SystemTime};
 use std::io::{self, Read, Write, ErrorKind};
 use std::fs::{Metadata, read_dir, File};
 use std::path::{Path, PathBuf};
 use log::{error, debug};
 
-use percent_encoding::percent_decode;
+use warp::hyper::StatusCode;
+use warp::{hyper::Method, reject, Filter, Rejection, Reply, filters::BoxedFilter};
+use warp::http::Response;
 
-use http_body_util::{combinators::BoxBody, BodyExt, Full, StreamBody};
-use hyper::body::Frame;
-use hyper::{Request, Response};
-use hyper::StatusCode;
-use tokio_util::io::ReaderStream;
-use futures_util::TryStreamExt;
+#[derive(Debug)]
+struct MethodError;
+impl reject::Reject for MethodError {}
+
+
+use percent_encoding::percent_decode;
 use mime_guess;
 
 use xml::reader::ParserConfig;
@@ -69,14 +72,17 @@ impl ServerPath {
     }
 
     fn file_to_url<P: AsRef<Path>>(&self, path: P) -> String {
-        let path = path.as_ref()
-            .strip_prefix(&self.srv_root)
-            .expect("file_to_url");
-        let url = self.url_prefix.clone().into_owned() + "/" + path.to_str().expect("file_to_url");
-
+        let mut path = path.as_ref().to_string_lossy().to_string();
+        if path.starts_with(self.srv_root.to_str().unwrap()){
+            path = path.replace(self.srv_root.to_str().unwrap(), "");
+        }
+        
+        
         // space to "%20" encoding
         // 최소한의 url encoding만 해준다.
-        let url = url.replace(" ", "%20");
+        let path = path.replace(" ", "%20");
+        let url = self.url_prefix.clone().into_owned() + &path;
+
         return url;
         // url.bytes().map(percent_encode_byte).collect::<String>()
     }
@@ -94,20 +100,6 @@ impl ServerPath {
             None
         }
     }
-}
-
-#[test]
-fn test_serverpath() {
-    let s = ServerPath::new("/dav", Path::new("/"));
-    assert_eq!(s.url_to_file("/dav/foo").unwrap().to_str().unwrap(), "/foo");
-    assert_eq!(s.url_to_file("/dav/foo/").unwrap().to_str().unwrap(),
-               "/foo");
-    assert_eq!(s.url_to_file("/dav/foo//").unwrap().to_str().unwrap(),
-               "/foo");
-    assert_eq!(s.url_to_file("/dav//foo//").unwrap().to_str().unwrap(),
-               "/foo");
-    assert_eq!(&s.file_to_url("/foo"), "/dav/foo");
-    assert_eq!(&s.file_to_url("/"), "/dav/");
 }
 
 #[derive(Debug, Clone)]
@@ -363,7 +355,16 @@ fn handle_propfind_path<W: Write>(xmlwriter: &mut EventWriter<W>, path: &PathBuf
             meta: &Metadata, props: &[OwnedName])-> Result<(), Error> {
     xmlwriter.write(XmlWEvent::start_element("D:response"))?;
 
-    let pathname = Url::parse(url).unwrap();
+    debug!("handle_propfind_path path: {:?}", path);
+
+    let path_result = Url::parse(url);
+    if path_result.is_err() {
+        let err = path_result.err().unwrap();
+        error!("err : {}", err);
+        return Ok(());
+    }
+    let pathname = path_result.unwrap();
+    // .unwrap();
     let pathname = pathname.path();
     debug!("pathname : {}", pathname);
     xmlwriter.write(XmlWEvent::start_element("D:href"))?;
@@ -413,38 +414,59 @@ fn handle_propfind_path<W: Write>(xmlwriter: &mut EventWriter<W>, path: &PathBuf
     Ok(())
 }
 
-fn io_error_to_status(e: io::Error) -> Response<BoxBody<Bytes, std::io::Error>>{
-    if e.kind() == ErrorKind::NotFound {
-        let res = Response::builder()
-                .status(StatusCode::NOT_FOUND)
-                .body(Full::new(NOTFOUND.into()).map_err(|e| match e {}).boxed())
-                .unwrap();
-        return res;
-    }
-
-    let res = Response::builder()
-                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .body(Full::new(INTERNAL_SERVER_ERROR.into()).map_err(|e| match e {}).boxed())
-                .unwrap();
-    return res;
+fn route_method_option() -> BoxedFilter<(impl Reply,)>{
+    let option_route = method("OPTIONS")
+    //.and(warp::path!(""))
+    .map(warp::reply)
+    .map(|reply| {
+            warp::reply::with_header(reply, "Access-Control-Allow-Methods", "OPTIONS,GET,PUT,DELETE,PROPFIND,COPY,MOVE")
+    })
+    .recover(handle_not_found).boxed();
+    return option_route;
 }
 
-fn make_error_res(status_code:StatusCode)-> Response<BoxBody<Bytes, std::io::Error>>{
-    let res_builder = Response::builder()
-        .status(status_code);
-    let res_builder = match status_code{
-        StatusCode::INTERNAL_SERVER_ERROR => res_builder.body(Full::new(INTERNAL_SERVER_ERROR.into()).map_err(|e| match e {}).boxed()),
-        StatusCode::NOT_FOUND => res_builder.body(Full::new(NOTFOUND.into()).map_err(|e| match e {}).boxed()),
-        StatusCode::BAD_REQUEST => res_builder.body(Full::new(BAD_REQUEST.into()).map_err(|e| match e {}).boxed()),
-        _ => res_builder.body(Full::new(INTERNAL_SERVER_ERROR.into()).map_err(|e| match e {}).boxed()),
-    };
-    return res_builder.unwrap();
+fn route_method_propfind(server:&Server) -> BoxedFilter<(impl Reply,)>{
+    let server2 = server.clone();
+    let option_route = method("PROPFIND")
+        //.and(warp::path!(""))
+        .and(warp::path::full())
+        .and(warp::header("Depth"))
+        .and(warp::body::bytes())
+        .map(move |fullpath: warp::path::FullPath, depth: u32, full_body:bytes::Bytes| {
+            server2.handle_propfind(fullpath, depth, full_body)
+        })
+        .recover(handle_not_found).boxed();
+    return option_route;
 }
 
-// https://stackoverflow.com/a/63651544/6652082
-fn to_tokio_async_read(r: impl futures::io::AsyncRead) -> impl tokio::io::AsyncRead {
-    tokio_util::compat::FuturesAsyncReadCompatExt::compat(r)
-}
+// fn io_error_to_status(e: io::Error) -> Response<BoxBody<Bytes, std::io::Error>>{
+//     if e.kind() == ErrorKind::NotFound {
+//         let res = Response::builder()
+//                 .status(StatusCode::NOT_FOUND)
+//                 .body(Full::new(NOTFOUND.into()).map_err(|e| match e {}).boxed())
+//                 .unwrap();
+//         return res;
+//     }
+
+//     let res = Response::builder()
+//                 .status(StatusCode::INTERNAL_SERVER_ERROR)
+//                 .body(Full::new(INTERNAL_SERVER_ERROR.into()).map_err(|e| match e {}).boxed())
+//                 .unwrap();
+//     return res;
+// }
+
+// fn make_error_res(status_code:StatusCode)-> Response<BoxBody<Bytes, std::io::Error>>{
+//     let res_builder = Response::builder()
+//         .status(status_code);
+//     let res_builder = match status_code{
+//         StatusCode::INTERNAL_SERVER_ERROR => res_builder.body(Full::new(INTERNAL_SERVER_ERROR.into()).map_err(|e| match e {}).boxed()),
+//         StatusCode::NOT_FOUND => res_builder.body(Full::new(NOTFOUND.into()).map_err(|e| match e {}).boxed()),
+//         StatusCode::BAD_REQUEST => res_builder.body(Full::new(BAD_REQUEST.into()).map_err(|e| match e {}).boxed()),
+//         _ => res_builder.body(Full::new(INTERNAL_SERVER_ERROR.into()).map_err(|e| match e {}).boxed()),
+//     };
+//     return res_builder.unwrap();
+// }
+
 
 impl Server {
     fn handle_propfind_path_recursive<W: Write>(&self,
@@ -481,24 +503,25 @@ impl Server {
         Ok(())
     }
 
-    fn uri_to_path(&self, req: &Request<hyper::body::Incoming>)
+    
+    
+    fn uri_to_path(&self, path: &str)
                    -> PathBuf {
-        let mut extend_path = req.uri().path();
-        extend_path = &extend_path[1..];
-        let extend_path = percent_decode(extend_path.as_bytes())
-            .decode_utf8_lossy();
+        let extend_path = path.to_string();
+        let extend_path = &extend_path[1..];
+        // let extend_path = percent_decode(extend_path.as_bytes())
+        //     .decode_utf8_lossy();
         let root_path = self.serverpath.srv_root.to_str().unwrap().to_string();
         let mut full_path = PathBuf::from(root_path);
-        full_path.push(extend_path.as_ref());
+        full_path.push(extend_path);
         return full_path;
     }
 
-    
-    fn uri_to_src_dst(&self,
-                      req: &Request<hyper::body::Incoming>)
+    /*
+    fn uri_to_src_dst(&self, path: PathBuf)
                       -> Result<(PathBuf, PathBuf), Error> {
         // Get the source
-        let src: PathBuf = self.uri_to_path(req);
+        let src = path;
         
         // Get the destination
         let dst = req.headers()
@@ -522,79 +545,53 @@ impl Server {
 
         Ok((src, dst))
     }
-    
+    */
 
-    async fn handle_propfind(&self, req: Request<hyper::body::Incoming>)
-                        -> Response<BoxBody<Bytes, std::io::Error>>{
+    fn handle_propfind(&self, path: warp::path::FullPath, depth: u32, body:bytes::Bytes)
+            -> Result<Response<String>, warp::http::Error>{
 
         // let res_sample = include_bytes!("sample01.xml");
-        // let res = Response::builder()
-        //         .status(StatusCode::MULTI_STATUS)
-        //         .body(Full::new(Bytes::from(Bytes::from(&res_sample[..]))).map_err(|e| match e {}).boxed())
-        //         .unwrap();
-        // return res;
         
-        // Get the file
-        let path = self.uri_to_path(&req);
-        debug!("Propfind {:?}", path);
-
-        // let header_map = req.headers();
-        // for (key, header_value ) in header_map{
-        //     debug!("header : {}", key);
-        //     let value = std::str::from_utf8(header_value.as_bytes());
-        //     debug!("value : {:?}", value.unwrap());
-        // }
-
-        // Get the depth
-        let depth = req.headers()
-            .get("Depth")
-            .and_then(|vec| Some(vec.as_bytes()))
-            .and_then(|vec| std::str::from_utf8(vec).ok())
-            .and_then(|s| s.parse::<u32>().ok())
-            .unwrap_or(0);
+        debug!("Propfind path: {:?}, depth : {}", path, depth);
 
         let parse_config = ParserConfig {
             trim_whitespace: true,
             ..Default::default()
         };
-        let whole_body = req.collect().await.unwrap();
         // debug!("==== body start =====");
         // debug!{"{:?}", whole_body};
-        // debug!("==== body end =====");
+        // debug!("==== bod
 
-        let body_buf = whole_body.aggregate();
-        let has_remaining = body_buf.has_remaining();
-        let mut body_reader = body_buf.reader();
+        let body_empty = body.is_empty();
+        let mut reader = body.reader();
 
         //// body에 전달되는 xml 이 없는 경우, 기본 사항을 response 한다.
-        if has_remaining == false {
+        if body_empty{
             let default_propfind = include_bytes!("default_propfind.xml");
-            let new_body = Full::new(Bytes::from(&default_propfind[..]));
-            let buffered = new_body.collect().await.unwrap();
-            body_reader = buffered.aggregate().reader();
+            let default_byte = Bytes::from_static(default_propfind);
+            reader = default_byte.reader();
         }
         
-        let xml = xml::reader::EventReader::new_with_config(&mut body_reader, parse_config);  
+        let xml = xml::reader::EventReader::new_with_config(&mut reader, parse_config);  
         let mut props = Vec::new();
 
         if let Err(e) = parse_propfind(xml, |prop| { props.push(prop); }) {
             error!("Propfind error {:?}", e);
-            let res = Response::builder()
+            return Response::builder()
                 .status(StatusCode::BAD_REQUEST)
-                .body(Full::new(BAD_REQUEST.into()).map_err(|e| match e {}).boxed())
-                .unwrap();
-            return res;
+                .body("".to_string());
         }
 
         // debug!("Propfind {:?} {:?}", path, props);
-        let meta_result = path.metadata();
+        
+        let path_buf = PathBuf::from_str(path.as_str()).unwrap();
+        let file_path = self.uri_to_path(path.as_str());
+        let meta_result = file_path.metadata();
         if meta_result.is_err(){
             error!("Propfind error No meta");
-            let res = Response::builder()
+            return Response::builder()
                 .status(StatusCode::BAD_REQUEST)
-                .body(Full::new(BAD_REQUEST.into()).map_err(|e| match e {}).boxed())
-                .unwrap();
-            return res;
+                .body("".to_string());
         }
 
         let meta = meta_result.unwrap();
@@ -612,33 +609,36 @@ impl Server {
         xmlwriter
             .write(XmlWEvent::start_element("D:multistatus").ns("D", "DAV:")).unwrap();
 
-        let _ = handle_propfind_path(&mut xmlwriter, &path,
-                             &self.serverpath.file_to_url(&path),
+        
+        let _ = handle_propfind_path(&mut xmlwriter, &file_path,
+                             &self.serverpath.file_to_url(&path.as_str()),
                              &meta,
                              &props);
 
         if meta.is_dir() {
-            self.handle_propfind_path_recursive(&path, depth, &mut xmlwriter, &props).unwrap();
+            self.handle_propfind_path_recursive(&file_path, depth, &mut xmlwriter, &props).unwrap();
         }
         xmlwriter.write(XmlWEvent::end_element()).unwrap();
         
-        let xlm_body = xmlwriter.into_inner();
+        let xlm_body: Vec<u8> = xmlwriter.into_inner();
+        let xlm_body_str = String::from_utf8(xlm_body).unwrap();
 
-        let xlm_body2 = xlm_body.clone();
-        let xlm_body_str = String::from_utf8(xlm_body2).unwrap();
-        debug!("==== Propfind Resonse start ====\n");
-        debug!("{}", xlm_body_str);
-        debug!("==== Propfind Resonse End ====\n");
+        // let xlm_body2 = xlm_body.clone();
+        // let xlm_body_str = String::from_utf8(xlm_body2).unwrap();
+        // debug!("==== Propfind Resonse start ====\n");
+        // debug!("{}", xlm_body_str);
+        // debug!("==== Propfind Resonse End ====\n");
         
+        //warp::reply::with_status(with_server, StatusCode::MULTI_STATUS);
+
 
         let res = Response::builder()
-                .status(StatusCode::MULTI_STATUS)
-                .body(Full::new(Bytes::from(xlm_body)).map_err(|e| match e {}).boxed())
-                .unwrap();
+            .status(StatusCode::MULTI_STATUS)
+            .body(xlm_body_str);
         return res;
     }
-
     
+    /*
     async fn handle_get(&self, req: Request<hyper::body::Incoming>) 
             -> Response<BoxBody<Bytes, std::io::Error>>{
         // Get the file
@@ -690,7 +690,9 @@ impl Server {
         return res;
 
     }
+    */
     
+    /*
     async fn handle_put(&self, req: Request<hyper::body::Incoming>)
                   -> Response<BoxBody<Bytes, std::io::Error>>{
         let path = self.uri_to_path(&req);
@@ -803,13 +805,61 @@ impl Server {
             .unwrap();       
         return res;
     }
+
+    */
 }
 
-pub async fn handle(server:&Server, req: Request<hyper::body::Incoming>) 
-    -> hyper::Result<Response<BoxBody<Bytes, std::io::Error>>> {
-    debug!("Request {:?}", req.method());
-    
+pub async fn handle_custom(reject: Rejection) -> Result<impl Reply, Rejection> {
+    if reject.find::<MethodError>().is_some() {
+        Ok(StatusCode::METHOD_NOT_ALLOWED)
+    } else {
+        Err(reject)
+    }
+}
 
+pub fn index_filter() -> impl Filter<Extract = (&'static str,), Error = Rejection> + Clone {
+    return warp::path!("index").map(|| "");
+}
+
+fn method(name: &'static str) -> impl Filter<Extract = (), Error = Rejection> + Clone {
+    warp::method()
+        .and_then(move |m: Method| async move {
+            if m == name {
+                Ok(())
+            } else {
+                Err(reject::custom(MethodError))
+            }
+        })
+        .untuple_one()
+}
+
+pub async fn handle_not_found(reject: Rejection) -> Result<impl Reply, Rejection> {
+    if reject.is_not_found() {
+        Ok(StatusCode::NOT_FOUND)
+    } else {
+        Err(reject)
+    }
+}
+
+
+pub async fn handle(server:&Server) 
+    -> BoxedFilter<(impl Reply,)> {
+    debug!("handle");
+
+    let method_option = route_method_option();
+    let method_propfind = route_method_propfind(server);
+    
+    let static_path = server.clone().serverpath.srv_root;
+    let asset_filter = warp::path("assets").and(
+        warp::fs::dir(static_path)
+    );
+
+    let boxed_filter = method_option
+        .or(method_propfind)
+        .or(asset_filter).boxed();
+
+    return boxed_filter;
+    /*
     let reqtype = match req.method().as_str().to_uppercase().as_str(){
         "OPTIONS" => RequestType::Options,
         "GET" => RequestType::Get,
@@ -851,27 +901,27 @@ pub async fn handle(server:&Server, req: Request<hyper::body::Incoming>)
             return Ok(res);
             
         }
-        RequestType::Propfind =>{
-            server.handle_propfind(req).await
-        }
+        // RequestType::Propfind =>{
+        //     server.handle_propfind(req).await
+        // }
         RequestType::Get => {
             server.handle_get(req).await
         },
-        RequestType::Put => {
-            server.handle_put(req).await
-        },
-        RequestType::Copy => {
-            server.handle_copy(req).await
-        },
-        RequestType::Move => {
-            server.handle_move(req).await
-        },
-        RequestType::Delete => {
-            server.handle_delete(req).await
-        },
-        RequestType::Mkdir => {
-            server.handle_mkdir(req).await
-        },
+        // RequestType::Put => {
+        //     server.handle_put(req).await
+        // },
+        // RequestType::Copy => {
+        //     server.handle_copy(req).await
+        // },
+        // RequestType::Move => {
+        //     server.handle_move(req).await
+        // },
+        // RequestType::Delete => {
+        //     server.handle_delete(req).await
+        // },
+        // RequestType::Mkdir => {
+        //     server.handle_mkdir(req).await
+        // },
         // _=>{
         //     error!("Request error");
         //     let res = Response::builder()
@@ -891,5 +941,6 @@ pub async fn handle(server:&Server, req: Request<hyper::body::Incoming>)
     //     hyper::header::HeaderValue::from_str("text/xml; charset=\"utf-8\"").unwrap());
     
     return Ok(result_res);
+    */
 }
 
