@@ -439,6 +439,37 @@ fn route_method_propfind(server:&Server) -> BoxedFilter<(impl Reply,)>{
     return option_route;
 }
 
+fn route_method_get(server:&Server) -> BoxedFilter<(impl Reply,)>{
+    //let server2 = server.clone();
+    let root_path = server.serverpath.srv_root.to_str().unwrap().to_string();
+    let get_route = method("GET")
+        .and(warp::fs::dir(root_path))
+        //.and(warp::path::full())
+        // .map(|file: warp::fs::File, fullpath: warp::path::FullPath| {
+
+        //     let guess = mime_guess::from_path(fullpath.as_str()).first().unwrap();
+        //     let mut context_type = guess.type_().as_str().to_string();
+        //     context_type.push('/');
+        //     context_type.push_str(guess.subtype().as_str());
+        //     if guess.type_().as_str().to_string().eq("text"){
+        //         context_type.push_str("; charset=utf-8");
+        //     }
+        //     context_type.push('/');
+        //     context_type.push_str(guess.subtype().as_str());
+        //     if guess.type_().as_str().to_string().eq("text"){
+        //         context_type.push_str("; charset=utf-8");
+        //     }
+
+        //     let res = Response::builder()
+        //         .header("content-type", context_type)
+        //         .status(StatusCode::OK)
+        //         .body(file).unwrap();
+        //     res
+        // })
+        .recover(handle_not_found).boxed();
+    return get_route;
+}
+
 // fn io_error_to_status(e: io::Error) -> Response<BoxBody<Bytes, std::io::Error>>{
 //     if e.kind() == ErrorKind::NotFound {
 //         let res = Response::builder()
@@ -638,55 +669,26 @@ impl Server {
         return res;
     }
     
-    /*
-    async fn handle_get(&self, req: Request<hyper::body::Incoming>) 
-            -> Response<BoxBody<Bytes, std::io::Error>>{
-        // Get the file
-        let path = self.uri_to_path(&req);
-        debug!("Get path {:?}", path);
-        
-        let file = tokio::fs::File::open(path.clone()).await;
-        if file.is_err() {
-            error!("ERROR: Unable to open file.");
-            return make_error_res(StatusCode::NOT_FOUND);
-            
-        }
-        let file = file.unwrap();
-        
-        let size = file.metadata().await
-            .map(|m| m.len())
-            .map_err(|e| io_error_to_status(e)).unwrap();
-
-        let reader_stream = ReaderStream::new(file);
-
-        // Convert to http_body_util::BoxBody
-        let stream_body = StreamBody::new(reader_stream.map_ok(Frame::data));
-        let boxed_body = stream_body.boxed();
     
-        // TODO: byte ranges (Accept-Ranges: bytes)
-        // Send response
-        let mut res = Response::builder()
-            .status(StatusCode::OK)
-            .body(boxed_body)
-            .unwrap();       
-            
-        let hadermap = res.headers_mut();
+    /* 
+    async fn handle_get(&self, path: warp::path::FullPath)
+            ->  Response<impl warp::filters::<Extract = (File,), Error = Rejection>>{
+        // Get the file
+        debug!("Get path {:?}", path);
 
-        // Ignore size = 0 to hopefully work reasonably with special files
-        if size > 0 {
-            hadermap.insert(hyper::header::CONTENT_LENGTH, hyper::header::HeaderValue::from(size));
-        }
-        let guess = mime_guess::from_path(path).first().unwrap();
+        let file_path = self.uri_to_path(path.as_str());
+        let guess = mime_guess::from_path(path.as_str()).first().unwrap();
         let mut context_type = guess.type_().as_str().to_string();
         context_type.push('/');
         context_type.push_str(guess.subtype().as_str());
         if guess.type_().as_str().to_string().eq("text"){
             context_type.push_str("; charset=utf-8");
         }
-        hadermap.insert(hyper::header::CONTENT_TYPE, hyper::header::HeaderValue::from_str(
-            &context_type
-        ).unwrap());
 
+        let warp_file = warp::fs::file(file_path.as_ref());
+        let res = Response::builder()
+            .header("content-type", context_type).body(warp_file).unwrap();
+        
         return res;
 
     }
@@ -848,6 +850,7 @@ pub async fn handle(server:&Server)
 
     let method_option = route_method_option();
     let method_propfind = route_method_propfind(server);
+    let method_get = route_method_get(server);
     
     let static_path = server.clone().serverpath.srv_root;
     let asset_filter = warp::path("assets").and(
@@ -856,6 +859,7 @@ pub async fn handle(server:&Server)
 
     let boxed_filter = method_option
         .or(method_propfind)
+        .or(method_get)
         .or(asset_filter).boxed();
 
     return boxed_filter;
